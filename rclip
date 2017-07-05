@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+
+import logging
+import os
+import socket
+import struct
+import subprocess
+import sys
+
+from enum import Enum
+from typing.io import IO
+
+SEND_BUF_SIZE = 2**16 - 1
+RECV_BUF_SIZE = 2**16 - 1
+DEFAULT_PORT = 9110
+
+logging.basicConfig(
+    level=os.environ.get('LOGLEVEL', 'WARNING'),
+    style='{',
+    format='[{asctime}] {levelname}: {message}',
+)
+
+
+def opoo(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+class ServerExistsError(Exception):
+    pass
+
+
+class CopyFailedError(Exception):
+    pass
+
+
+class RClipProtocolError(Exception):
+    pass
+
+
+class OpCode(Enum):
+    Ping = 1
+    CopyRequest = 2
+    PasteRequest = 3
+    ClipboardContents = 4
+    EndOfClipboard = 5
+    Ack = 6
+    Nak = 7
+
+
+class MessageHeader(object):
+    fmt = '!3sBH'
+    preamble = b'RCL'
+
+    def __init__(self, opcode: OpCode, length: int=0):
+        self.opcode = opcode
+        self.length = length
+
+    def __repr__(self):
+        return '<MessageHeader {} {}>'.format(self.opcode, self.length)
+
+    def send(self, sock: socket.socket):
+        logging.debug('sent header %s', self)
+        sock.sendall(
+            struct.pack(
+                MessageHeader.fmt,
+                MessageHeader.preamble,
+                self.opcode.value,
+                self.length,
+            )
+        )
+
+    @staticmethod
+    def recv(sock: socket.socket) -> 'MessageHeader':
+        buf = sock.recv(struct.calcsize(MessageHeader.fmt))
+        if len(buf) < struct.calcsize(MessageHeader.fmt):
+            raise RClipProtocolError
+        preamble, opcode, length = struct.unpack(MessageHeader.fmt, buf)
+        if preamble != MessageHeader.preamble:
+            raise RClipProtocolError
+        logging.debug(
+            'received header %s', MessageHeader(OpCode(opcode), length)
+        )
+        return MessageHeader(OpCode(opcode), length)
+
+
+def reusable_tcp_socket() -> socket.socket:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_FASTOPEN, 1)
+    except OSError:
+        pass
+    return sock
+
+
+def recv_pipe(sock: socket.socket, dst: IO[bytes]):
+    hdr = MessageHeader.recv(sock)
+    while hdr.opcode == OpCode.ClipboardContents:
+        bcount = hdr.length
+        while bcount > 0:
+            buf = sock.recv(min(bcount, RECV_BUF_SIZE))
+            if len(buf) == 0:
+                raise RClipProtocolError
+            dst.write(buf)
+            bcount -= len(buf)
+        hdr = MessageHeader.recv(sock)
+
+    if hdr.opcode != OpCode.EndOfClipboard:
+        raise RClipProtocolError
+
+
+def send_pipe(sock: socket.socket, src: IO[bytes]):
+    buf = src.read(SEND_BUF_SIZE)
+    while len(buf) > 0:
+        MessageHeader(OpCode.ClipboardContents, len(buf)).send(sock)
+        sock.sendall(buf)
+        buf = src.read(SEND_BUF_SIZE)
+    MessageHeader(OpCode.EndOfClipboard).send(sock)
+
+
+class RClipServer(object):
+    def __init__(self, host: str, port: int, singleton=False):
+        if singleton:
+            sock = reusable_tcp_socket()
+            try:
+                sock.connect((host, port))
+                MessageHeader(OpCode.Ping).send(sock)
+                hdr = MessageHeader.recv(sock)
+                if hdr.opcode == OpCode.Ping:
+                    sock.close()
+                    raise ServerExistsError
+            except ServerExistsError:
+                raise ServerExistsError
+            except:
+                pass
+            finally:
+                sock.close()
+
+        self.sock = reusable_tcp_socket()
+        self.sock.bind((host, port))
+        self.sock.listen()
+
+    def listen_loop(self):
+        while True:
+            try:
+                sock, addr = self.sock.accept()
+            except KeyboardInterrupt:
+                # XXX: there has to be a better way
+                break
+
+            try:
+                hdr = MessageHeader.recv(sock)
+            except RClipProtocolError:
+                sock.close()
+                continue
+
+            try:
+                if hdr.opcode == OpCode.Ping:
+                    MessageHeader(OpCode.Ping).send(sock)
+                elif hdr.opcode == OpCode.CopyRequest:
+                    logging.info('COPY from %s', ':'.join(map(str, addr)))
+                    self.copy(sock)
+                elif hdr.opcode == OpCode.PasteRequest:
+                    logging.info('PASTE to %s', ':'.join(map(str, addr)))
+                    self.paste(sock)
+            except RClipProtocolError:
+                sock.close()
+
+    def copy(self, sock: socket.socket):
+        pbcopy = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+        try:
+            recv_pipe(sock, pbcopy.stdin)
+        except RClipProtocolError:
+            pbcopy.kill()
+        pbcopy.communicate()
+        rc = pbcopy.wait(timeout=5)
+        if rc == 0:
+            opcode = OpCode.Ack
+        else:
+            opcode = OpCode.Nak
+        MessageHeader(opcode).send(sock)
+
+    def paste(self, sock: socket.socket):
+        pbpaste = subprocess.Popen(['pbpaste'], stdout=subprocess.PIPE)
+        send_pipe(sock, pbpaste.stdout)
+        hdr = MessageHeader.recv(sock)
+        if hdr.opcode == OpCode.Ack:
+            pass
+        elif hdr.opcode == OpCode.Nak:
+            pass
+        else:
+            raise RClipProtocolError
+
+
+class RClipClient(object):
+    def __init__(self, host: str, port: int):
+        self.sock = reusable_tcp_socket()
+        self.sock.connect((host, port))
+
+    def paste(self):
+        MessageHeader(OpCode.PasteRequest).send(self.sock)
+        recv_pipe(self.sock, sys.stdout.buffer)
+        MessageHeader(OpCode.Ack).send(self.sock)
+
+    def copy(self):
+        MessageHeader(OpCode.CopyRequest).send(self.sock)
+        send_pipe(self.sock, sys.stdin.buffer)
+        hdr = MessageHeader.recv(self.sock)
+        if hdr.opcode == OpCode.Ack:
+            pass
+        elif hdr.opcode == OpCode.Nak:
+            raise CopyFailedError
+        else:
+            raise RClipProtocolError
+
+
+def main():
+    called_as = sys.argv[0]
+
+    try:
+        mode = sys.argv[1]
+    except IndexError:
+        if called_as.endswith('copy'):
+            mode = 'copy'
+        elif called_as.endswith('paste'):
+            mode = 'paste'
+        else:
+            mode = 'server'
+
+    try:
+        port = int(sys.argv[2])
+    except IndexError:
+        port = DEFAULT_PORT
+
+    if mode.endswith('server'):
+        singleton = False
+        if mode == 'ensure-server':
+            singleton = True
+        try:
+            server = RClipServer('127.0.0.1', port, singleton)
+        except ServerExistsError:
+            sys.exit(0)
+        except Exception as e:
+            opoo('listen failed', e)
+            sys.exit(1)
+        try:
+            server.listen_loop()
+        except Exception as e:
+            opoo('server error', e)
+            sys.exit(1)
+    elif mode == 'copy':
+        try:
+            client = RClipClient('127.0.0.1', port)
+        except Exception as e:
+            opoo('failed to connect', e)
+            sys.exit(1)
+        try:
+            client.copy()
+        except Exception as e:
+            opoo('failed to copy', e)
+            sys.exit(1)
+    elif mode == 'paste':
+        try:
+            client = RClipClient('127.0.0.1', port)
+        except Exception as e:
+            opoo('failed to connect', e)
+            sys.exit(1)
+        try:
+            client.paste()
+        except Exception as e:
+            opoo('failed to paste', e)
+            sys.exit(1)
+    else:
+        opoo('unknown mode', mode)
+
+
+if __name__ == '__main__':
+    main()

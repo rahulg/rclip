@@ -36,6 +36,34 @@ ln -s rclip pbpaste
 
 `pbpaste` on the remote box functions the same as `rclip paste`.
 
+## Set-up: launchd edition
+
+Conceptually, it is preferable to launch your rclip server using launchd, but that increases the latency of copying & pasting by around 500ms.
+I consider waiting nearly a second for a paste to be annoying. If you don't, then skip the `LocalCommand` directives
+in your SSH config file, and drop the following into `~/Library/LaunchAgents/io.rahulg.rclip.plist` instead.
+
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.rahulg.rclip</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/python3</string>
+		<string>/usr/local/bin/rclip</string>
+		<string>server</string>
+		<string>9110</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>
+```
+
+And run `launchctl load -w ~/Library/LaunchAgents/io.rahulg.rclip.plist`.
+
 # CLI Details
 
 ```

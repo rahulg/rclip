@@ -12,6 +12,9 @@ cleartext.
 
 Scenario: you have a Mac that you use as a client with a remote dev box running Linux.
 
+NOTE: your machines will have to have a reasonable amount of time synchronisation (within 2s), as the timestamp is used to prevent replay attacks.
+If your environment has a time drift problem, edit `TIME_DRIFT_ALLOWANCE` in rclip.
+
 Place `rclip` somewhere convenient on your local Mac, we'll go with `/usr/local/bin`.
 
 Generate a shared secret by running `rclip generate-secret`.

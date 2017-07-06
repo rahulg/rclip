@@ -312,11 +312,13 @@ def main():
         with SECRET_FILE.open('wb') as sf:
             secret = os.urandom(SECRET_SIZE)
             sf.write(binascii.hexlify(secret))
-        opoo('new secret in:', SECRET_FILE)
+        opoo('new secret generated, run `rclip secret` or check', SECRET_FILE)
 
     secret = binascii.unhexlify(SECRET_FILE.read_text().strip())
 
-    if mode.endswith('server'):
+    if mode == 'secret':
+        print(binascii.hexlify(secret).decode('ascii'))
+    elif mode.endswith('server'):
         singleton = False
         if mode == 'ensure-server':
             singleton = True

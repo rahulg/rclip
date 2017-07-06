@@ -3,7 +3,7 @@
 Expose your clipboard over TCP. This sounds ridiculous, especially if you use a password manager, until you realise that this allows you to access
 your clipboard while `ssh`ed into a box.
 
-Note: you MUST trust `root` and anyone able to log in as your user on the remote and local systems if you use this, since they can connect to the
+NOTE: you MUST trust `root` and anyone able to log in as your user on the remote and local systems if you use this, since they can connect to the
 TCP socket and pull the contents of your clipboard. In addition, anyone with packet capture privileges on the remote end will see your traffic in
 cleartext.
 
@@ -46,30 +46,11 @@ ln -s rclip pbpaste
 ## Set-up: launchd edition
 
 Conceptually, it is preferable to launch your rclip server using launchd, but that increases the latency of copying & pasting by around 500ms.
-I consider waiting nearly a second for a paste to be annoying. If you don't, then skip the `LocalCommand` directives
-in your SSH config file, and drop the following into `~/Library/LaunchAgents/io.rahulg.rclip.plist` instead.
+I consider waiting nearly a second for a paste to be annoying.
 
-```
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>io.rahulg.rclip</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/usr/local/bin/python3</string>
-		<string>/usr/local/bin/rclip</string>
-		<string>server</string>
-		<string>9110</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-</dict>
-</plist>
-```
-
-And run `launchctl load -w ~/Library/LaunchAgents/io.rahulg.rclip.plist`.
+If you don't, then skip the `LocalCommand` directives in your SSH config file,
+drop `io.rahulg.rclip.plist` from this repo into `~/Library/LaunchAgents/`, and run
+`launchctl load -w ~/Library/LaunchAgents/io.rahulg.rclip.plist`.
 
 
 # CLI Details

@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 
+import binascii
+import hmac
 import logging
 import os
 import socket
 import struct
 import subprocess
 import sys
+import time
 
 from enum import Enum
-from typing.io import IO
+from pathlib import Path
 
-SEND_BUF_SIZE = 2**16 - 1
-RECV_BUF_SIZE = 2**16 - 1
 DEFAULT_PORT = 9110
+TIME_DRIFT_ALLOWANCE = 2
+
+MAX_MSG_LEN = 2**16 - 1
+try:
+    XDG_CONFIG_HOME = Path(os.environ['XDG_CONFIG_HOME'])
+except KeyError:
+    XDG_CONFIG_HOME = Path.home() / '.config'
+CONFIG_DIR = XDG_CONFIG_HOME / 'rclip'
+SECRET_FILE = CONFIG_DIR / 'secret'
+SECRET_SIZE = 32
 
 logging.basicConfig(
     level=os.environ.get('LOGLEVEL', 'WARNING'),
@@ -23,6 +34,14 @@ logging.basicConfig(
 
 def opoo(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+class MessageTooLargeError(Exception):
+    pass
+
+
+class AuthenticationError(Exception):
+    pass
 
 
 class ServerExistsError(Exception):
@@ -47,40 +66,95 @@ class OpCode(Enum):
     Nak = 7
 
 
-class MessageHeader(object):
-    fmt = '!3sBH'
+class Message(object):
+    header_fmt = '!3siBH'
     preamble = b'RCL'
+    hmac_digest = 'sha256'
 
-    def __init__(self, opcode: OpCode, length: int=0):
+    def __init__(
+        self,
+        secret: bytes,
+        sock: socket.socket,
+        opcode: OpCode,
+        data: bytearray=bytearray()
+    ):
+        self.secret = secret
+        self.sock = sock
         self.opcode = opcode
-        self.length = length
+        self.data = data
 
     def __repr__(self):
-        return '<MessageHeader {} {}>'.format(self.opcode, self.length)
+        return '<Message {} {}>'.format(self.opcode, len(self.data))
 
-    def send(self, sock: socket.socket):
-        logging.debug('sent header %s', self)
-        sock.sendall(
-            struct.pack(
-                MessageHeader.fmt,
-                MessageHeader.preamble,
-                self.opcode.value,
-                self.length,
-            )
+    def send(self):
+        if len(self.data) > MAX_MSG_LEN:
+            raise MessageTooLargeError
+
+        _hmac = hmac.new(self.secret, digestmod=Message.hmac_digest)
+
+        hdr_data = struct.pack(
+            Message.header_fmt,
+            Message.preamble,
+            int(time.time()),
+            self.opcode.value,
+            len(self.data),
         )
+        _hmac.update(hdr_data)
+        self.sock.sendall(hdr_data)
+        logging.debug('SENDHEDR %s %s', self.opcode, len(self.data))
+
+        _hmac.update(self.data)
+        self.sock.sendall(self.data)
+        logging.debug('SENDDATA %s', self.data)
+
+        dgst = _hmac.digest()
+        self.sock.sendall(dgst)
+        logging.debug('SENDHMAC %s', binascii.hexlify(dgst))
 
     @staticmethod
-    def recv(sock: socket.socket) -> 'MessageHeader':
-        buf = sock.recv(struct.calcsize(MessageHeader.fmt))
-        if len(buf) < struct.calcsize(MessageHeader.fmt):
+    def recv(secret: bytes, sock: socket.socket) -> 'Message':
+        _hmac = hmac.new(secret, digestmod=Message.hmac_digest)
+
+        buf = sock.recv(struct.calcsize(Message.header_fmt))
+        if len(buf) < struct.calcsize(Message.header_fmt):
             raise RClipProtocolError
-        preamble, opcode, length = struct.unpack(MessageHeader.fmt, buf)
-        if preamble != MessageHeader.preamble:
-            raise RClipProtocolError
-        logging.debug(
-            'received header %s', MessageHeader(OpCode(opcode), length)
+
+        _hmac.update(buf)
+        preamble, timestamp, opcode, length = struct.unpack(
+            Message.header_fmt, buf
         )
-        return MessageHeader(OpCode(opcode), length)
+        if preamble != Message.preamble:
+            raise RClipProtocolError
+        if abs(time.time() - timestamp) > TIME_DRIFT_ALLOWANCE:
+            raise AuthenticationError
+
+        msg = Message(secret, sock, OpCode(opcode))
+        logging.debug('RECVHEDR %s %s', OpCode(opcode), length)
+        msg.data = bytearray()
+        bcount = length
+        while bcount > 0:
+            buf = sock.recv(min(bcount, MAX_MSG_LEN))
+            if len(buf) == 0:
+                raise RClipProtocolError
+            _hmac.update(buf)
+            msg.data.extend(buf)
+            bcount -= len(buf)
+        logging.debug('RECVDATA %s', msg.data)
+
+        msg_dgst = bytearray()
+        bcount = 32
+        while bcount > 0:
+            buf = sock.recv(min(bcount, 32))
+            if len(buf) == 0:
+                raise RClipProtocolError
+            msg_dgst.extend(buf)
+            bcount -= len(buf)
+
+        logging.debug('RECVHMAC %s', binascii.hexlify(msg_dgst))
+        if not hmac.compare_digest(_hmac.digest(), msg_dgst):
+            raise AuthenticationError
+
+        return msg
 
 
 def reusable_tcp_socket() -> socket.socket:
@@ -95,41 +169,19 @@ def reusable_tcp_socket() -> socket.socket:
     return sock
 
 
-def recv_pipe(sock: socket.socket, dst: IO[bytes]):
-    hdr = MessageHeader.recv(sock)
-    while hdr.opcode == OpCode.ClipboardContents:
-        bcount = hdr.length
-        while bcount > 0:
-            buf = sock.recv(min(bcount, RECV_BUF_SIZE))
-            if len(buf) == 0:
-                raise RClipProtocolError
-            dst.write(buf)
-            bcount -= len(buf)
-        hdr = MessageHeader.recv(sock)
-
-    if hdr.opcode != OpCode.EndOfClipboard:
-        raise RClipProtocolError
-
-
-def send_pipe(sock: socket.socket, src: IO[bytes]):
-    buf = src.read(SEND_BUF_SIZE)
-    while len(buf) > 0:
-        MessageHeader(OpCode.ClipboardContents, len(buf)).send(sock)
-        sock.sendall(buf)
-        buf = src.read(SEND_BUF_SIZE)
-    MessageHeader(OpCode.EndOfClipboard).send(sock)
+def format_addr(addr):
+    return ':'.join(map(str, addr))
 
 
 class RClipServer(object):
-    def __init__(self, host: str, port: int, singleton=False):
+    def __init__(self, secret: bytes, host: str, port: int, singleton=False):
         if singleton:
             sock = reusable_tcp_socket()
             try:
                 sock.connect((host, port))
-                MessageHeader(OpCode.Ping).send(sock)
-                hdr = MessageHeader.recv(sock)
-                if hdr.opcode == OpCode.Ping:
-                    sock.close()
+                Message(secret, sock, OpCode.Ping).send()
+                msg = Message.recv(secret, sock)
+                if msg.opcode == OpCode.Ping:
                     raise ServerExistsError
             except ServerExistsError:
                 raise ServerExistsError
@@ -138,6 +190,7 @@ class RClipServer(object):
             finally:
                 sock.close()
 
+        self.secret = secret
         self.sock = reusable_tcp_socket()
         self.sock.bind((host, port))
         self.sock.listen()
@@ -151,27 +204,33 @@ class RClipServer(object):
                 break
 
             try:
-                hdr = MessageHeader.recv(sock)
-            except RClipProtocolError:
-                sock.close()
-                continue
+                msg = Message.recv(self.secret, sock)
 
-            try:
-                if hdr.opcode == OpCode.Ping:
-                    MessageHeader(OpCode.Ping).send(sock)
-                elif hdr.opcode == OpCode.CopyRequest:
-                    logging.info('COPY from %s', ':'.join(map(str, addr)))
+                if msg.opcode == OpCode.Ping:
+                    Message(self.secret, sock, OpCode.Ping).send()
+                elif msg.opcode == OpCode.CopyRequest:
+                    logging.info('COPY from %s', format_addr(addr))
                     self.copy(sock)
-                elif hdr.opcode == OpCode.PasteRequest:
-                    logging.info('PASTE to %s', ':'.join(map(str, addr)))
+                elif msg.opcode == OpCode.PasteRequest:
+                    logging.info('PASTE to %s', format_addr(addr))
                     self.paste(sock)
+            except AuthenticationError:
+                logging.warning('AuthenticationError: %s', format_addr(addr))
+                sock.close()
             except RClipProtocolError:
                 sock.close()
 
     def copy(self, sock: socket.socket):
         pbcopy = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
         try:
-            recv_pipe(sock, pbcopy.stdin)
+            msg = Message.recv(self.secret, sock)
+            while msg.opcode == OpCode.ClipboardContents:
+                pbcopy.stdin.write(msg.data)
+                msg = Message.recv(self.secret, sock)
+
+            if msg.opcode != OpCode.EndOfClipboard:
+                raise RClipProtocolError
+
         except RClipProtocolError:
             pbcopy.kill()
         pbcopy.communicate()
@@ -180,37 +239,50 @@ class RClipServer(object):
             opcode = OpCode.Ack
         else:
             opcode = OpCode.Nak
-        MessageHeader(opcode).send(sock)
+        Message(self.secret, sock, opcode).send()
 
     def paste(self, sock: socket.socket):
         pbpaste = subprocess.Popen(['pbpaste'], stdout=subprocess.PIPE)
-        send_pipe(sock, pbpaste.stdout)
-        hdr = MessageHeader.recv(sock)
-        if hdr.opcode == OpCode.Ack:
+        buf = pbpaste.stdout.read(MAX_MSG_LEN)
+        while len(buf) > 0:
+            Message(self.secret, sock, OpCode.ClipboardContents, buf).send()
+            buf = pbpaste.stdout.read(MAX_MSG_LEN)
+        Message(self.secret, sock, OpCode.EndOfClipboard).send()
+        msg = Message.recv(self.secret, sock)
+        if msg.opcode == OpCode.Ack:
             pass
-        elif hdr.opcode == OpCode.Nak:
+        elif msg.opcode == OpCode.Nak:
             pass
         else:
             raise RClipProtocolError
 
 
 class RClipClient(object):
-    def __init__(self, host: str, port: int):
+    def __init__(self, secret: bytes, host: str, port: int):
+        self.secret = secret
         self.sock = reusable_tcp_socket()
         self.sock.connect((host, port))
 
     def paste(self):
-        MessageHeader(OpCode.PasteRequest).send(self.sock)
-        recv_pipe(self.sock, sys.stdout.buffer)
-        MessageHeader(OpCode.Ack).send(self.sock)
+        Message(self.secret, self.sock, OpCode.PasteRequest).send()
+        msg = Message.recv(self.secret, self.sock)
+        while msg.opcode == OpCode.ClipboardContents:
+            sys.stdout.buffer.write(msg.data)
+            msg = Message.recv(self.secret, self.sock)
+        Message(self.secret, self.sock, OpCode.Ack).send()
 
     def copy(self):
-        MessageHeader(OpCode.CopyRequest).send(self.sock)
-        send_pipe(self.sock, sys.stdin.buffer)
-        hdr = MessageHeader.recv(self.sock)
-        if hdr.opcode == OpCode.Ack:
+        Message(self.secret, self.sock, OpCode.CopyRequest).send()
+        buf = sys.stdin.buffer.read(MAX_MSG_LEN)
+        while len(buf) > 0:
+            Message(self.secret, self.sock, OpCode.ClipboardContents,
+                    buf).send()
+            buf = sys.stdin.buffer.read(MAX_MSG_LEN)
+        Message(self.secret, self.sock, OpCode.EndOfClipboard).send()
+        msg = Message.recv(self.secret, self.sock)
+        if msg.opcode == OpCode.Ack:
             pass
-        elif hdr.opcode == OpCode.Nak:
+        elif msg.opcode == OpCode.Nak:
             raise CopyFailedError
         else:
             raise RClipProtocolError
@@ -234,43 +306,55 @@ def main():
     except IndexError:
         port = DEFAULT_PORT
 
+    if not SECRET_FILE.exists():
+        opoo('shared secret does not exist. generating...')
+        CONFIG_DIR.mkdir(0o700, parents=True, exist_ok=True)
+        with SECRET_FILE.open('wb') as sf:
+            secret = os.urandom(SECRET_SIZE)
+            sf.write(binascii.hexlify(secret))
+        opoo('new secret in:', SECRET_FILE)
+
+    secret = binascii.unhexlify(SECRET_FILE.read_text().strip())
+
     if mode.endswith('server'):
         singleton = False
         if mode == 'ensure-server':
             singleton = True
         try:
-            server = RClipServer('127.0.0.1', port, singleton)
+            server = RClipServer(secret, '127.0.0.1', port, singleton)
         except ServerExistsError:
             sys.exit(0)
-        except Exception as e:
-            opoo('listen failed', e)
-            sys.exit(1)
-        try:
-            server.listen_loop()
-        except Exception as e:
-            opoo('server error', e)
-            sys.exit(1)
+        server.listen_loop()
     elif mode == 'copy':
         try:
-            client = RClipClient('127.0.0.1', port)
-        except Exception as e:
-            opoo('failed to connect', e)
+            client = RClipClient(secret, '127.0.0.1', port)
+        except socket.error:
+            opoo('connection failed')
             sys.exit(1)
         try:
             client.copy()
-        except Exception as e:
-            opoo('failed to copy', e)
+        except CopyFailedError:
+            opoo('server error occurred while copying')
+            sys.exit(1)
+        except RClipProtocolError:
+            opoo('protocol error occurred while copying')
+            sys.exit(1)
+        except socket.error as e:
+            opoo('error occurred while copying', e)
             sys.exit(1)
     elif mode == 'paste':
         try:
-            client = RClipClient('127.0.0.1', port)
-        except Exception as e:
-            opoo('failed to connect', e)
+            client = RClipClient(secret, '127.0.0.1', port)
+        except socket.error:
+            opoo('connection failed')
             sys.exit(1)
         try:
             client.paste()
-        except Exception as e:
-            opoo('failed to paste', e)
+        except RClipProtocolError:
+            opoo('protocol error occurred while pasting')
+            sys.exit(1)
+        except socket.error as e:
+            opoo('error occurred while pasting', e)
             sys.exit(1)
     else:
         opoo('unknown mode', mode)

@@ -301,18 +301,40 @@ def main():
         else:
             mode = 'server'
 
+    if mode.endswith('-secret'):
+        if mode == 'generate-secret':
+            secret = os.urandom(SECRET_SIZE)
+        elif mode == 'set-secret':
+            hexsecret = input('secret: ')
+            if len(hexsecret) != SECRET_SIZE * 2:
+                opoo('secret should be 32 bytes')
+                sys.exit(1)
+            try:
+                secret = binascii.unhexlify(hexsecret)
+            except binascii.Error:
+                opoo(
+                    'secret format error, expected 32 bytes in hexadecimal format'
+                )
+                sys.exit(1)
+
+        CONFIG_DIR.mkdir(0o700, parents=True, exist_ok=True)
+        with SECRET_FILE.open('wb') as sf:
+            sf.write(binascii.hexlify(secret))
+        opoo('secret written to', SECRET_FILE)
+
+        sys.exit(0)
+
     try:
         port = int(sys.argv[2])
     except IndexError:
         port = DEFAULT_PORT
 
     if not SECRET_FILE.exists():
-        opoo('shared secret does not exist. generating...')
-        CONFIG_DIR.mkdir(0o700, parents=True, exist_ok=True)
-        with SECRET_FILE.open('wb') as sf:
-            secret = os.urandom(SECRET_SIZE)
-            sf.write(binascii.hexlify(secret))
-        opoo('new secret generated, run `rclip secret` or check', SECRET_FILE)
+        opoo(
+            'shared secret does not exist.'
+            'run `rclip generate-secret` to generate or `rclip set-secret` to use an existing one'
+        )
+        sys.exit(1)
 
     secret = binascii.unhexlify(SECRET_FILE.read_text().strip())
 
@@ -327,6 +349,7 @@ def main():
         except ServerExistsError:
             sys.exit(0)
         server.listen_loop()
+
     elif mode == 'copy':
         try:
             client = RClipClient(secret, '127.0.0.1', port)
@@ -344,6 +367,7 @@ def main():
         except socket.error as e:
             opoo('error occurred while copying', e)
             sys.exit(1)
+
     elif mode == 'paste':
         try:
             client = RClipClient(secret, '127.0.0.1', port)

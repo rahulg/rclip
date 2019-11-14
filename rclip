@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import argparse
 import binascii
+import getpass
 import hmac
 import logging
 import os
@@ -44,10 +46,6 @@ class AuthenticationError(Exception):
     pass
 
 
-class ServerExistsError(Exception):
-    pass
-
-
 class CopyFailedError(Exception):
     pass
 
@@ -76,8 +74,8 @@ class Message(object):
         secret: bytes,
         sock: socket.socket,
         opcode: OpCode,
-        data: bytearray=bytearray()
-    ):
+        data: bytearray = bytearray(),
+    ) -> None:
         self.secret = secret
         self.sock = sock
         self.opcode = opcode
@@ -174,26 +172,11 @@ def format_addr(addr):
 
 
 class RClipServer(object):
-    def __init__(self, secret: bytes, host: str, port: int, singleton=False):
-        if singleton:
-            sock = reusable_tcp_socket()
-            try:
-                sock.connect((host, port))
-                Message(secret, sock, OpCode.Ping).send()
-                msg = Message.recv(secret, sock)
-                if msg.opcode == OpCode.Ping:
-                    raise ServerExistsError
-            except ServerExistsError:
-                raise ServerExistsError
-            except:
-                pass
-            finally:
-                sock.close()
-
+    def __init__(self, secret: bytes, host: str, port: int) -> None:
         self.secret = secret
         self.sock = reusable_tcp_socket()
         self.sock.bind((host, port))
-        self.sock.listen()
+        self.sock.listen(8)
 
     def listen_loop(self):
         while True:
@@ -214,6 +197,8 @@ class RClipServer(object):
                 elif msg.opcode == OpCode.PasteRequest:
                     logging.info('PASTE to %s', format_addr(addr))
                     self.paste(sock)
+            except BrokenPipeError:
+                sock.close()
             except AuthenticationError:
                 logging.warning('AuthenticationError: %s', format_addr(addr))
                 sock.close()
@@ -258,7 +243,7 @@ class RClipServer(object):
 
 
 class RClipClient(object):
-    def __init__(self, secret: bytes, host: str, port: int):
+    def __init__(self, secret: bytes, host: str, port: int) -> None:
         self.secret = secret
         self.sock = reusable_tcp_socket()
         self.sock.connect((host, port))
@@ -289,101 +274,141 @@ class RClipClient(object):
 
 
 def main():
-    called_as = sys.argv[0]
+    parser = argparse.ArgumentParser(prog='rclip')
+    parser.add_argument('--port', '-p', type=int, default=DEFAULT_PORT, help='TCP port number used by rclip')
+    commands = parser.add_subparsers(help='commands')
+
+    copy = commands.add_parser('copy', help='copy to remote clipboard')
+    copy.set_defaults(func=copy_cmd)
+
+    paste = commands.add_parser('paste', help='paste from remote clipboard')
+    paste.set_defaults(func=paste_cmd)
+
+    server = commands.add_parser('server', help='run server')
+    server.set_defaults(func=server_cmd)
+
+    gen_secret = commands.add_parser('generate-secret', help='generate shared secret')
+    gen_secret.set_defaults(func=gen_secret_cmd)
+
+    set_secret = commands.add_parser('set-secret', help='set shared secret')
+    set_secret.set_defaults(func=set_secret_cmd)
+
+    get_secret = commands.add_parser('get-secret', help='print shared secret')
+    get_secret.set_defaults(func=get_secret_cmd)
+
+    args = parser.parse_args()
+    rc = args.func(args)
+    sys.exit(rc)
+
+
+def gen_secret_cmd(args: argparse.Namespace) -> int:
+    secret = os.urandom(SECRET_SIZE)
+    try:
+        set_secret(secret)
+        return 0
+    except Exception as e:
+        opoo(e)
+        return 1
+
+
+def set_secret_cmd(args: argparse.Namespace) -> int:
+    hexsecret = getpass.getpass('secret: ')
+    if len(hexsecret) != SECRET_SIZE * 2:
+        opoo('secret should be 32 bytes')
+        return 1
+    try:
+        secret = binascii.unhexlify(hexsecret)
+    except binascii.Error:
+        opoo(
+            'secret format error, expected 32 bytes in hexadecimal format'
+        )
+        return 1
 
     try:
-        mode = sys.argv[1]
-    except IndexError:
-        if called_as.endswith('copy'):
-            mode = 'copy'
-        elif called_as.endswith('paste'):
-            mode = 'paste'
-        else:
-            mode = 'server'
+        set_secret(secret)
+        return 0
+    except Exception as e:
+        opoo(e)
+        return 1
 
-    if mode.endswith('-secret'):
-        if mode == 'generate-secret':
-            secret = os.urandom(SECRET_SIZE)
-        elif mode == 'set-secret':
-            hexsecret = input('secret: ')
-            if len(hexsecret) != SECRET_SIZE * 2:
-                opoo('secret should be 32 bytes')
-                sys.exit(1)
-            try:
-                secret = binascii.unhexlify(hexsecret)
-            except binascii.Error:
-                opoo(
-                    'secret format error, expected 32 bytes in hexadecimal format'
-                )
-                sys.exit(1)
 
-        CONFIG_DIR.mkdir(0o700, parents=True, exist_ok=True)
-        with SECRET_FILE.open('wb') as sf:
-            sf.write(binascii.hexlify(secret))
-        opoo('secret written to', SECRET_FILE)
+def set_secret(secret: bytes):
+    CONFIG_DIR.mkdir(0o700, parents=True, exist_ok=True)
+    with SECRET_FILE.open('wb') as sf:
+        sf.write(binascii.hexlify(secret))
+    opoo('secret written to', SECRET_FILE)
 
-        sys.exit(0)
 
-    try:
-        port = int(sys.argv[2])
-    except IndexError:
-        port = DEFAULT_PORT
-
+def get_secret() -> bytes:
     if not SECRET_FILE.exists():
         opoo(
             'shared secret does not exist.'
             'run `rclip generate-secret` to generate or `rclip set-secret` to use an existing one'
         )
-        sys.exit(1)
+        raise AssertionError
 
     secret = binascii.unhexlify(SECRET_FILE.read_text().strip())
+    return secret
 
-    if mode == 'secret':
+
+def get_secret_cmd(args: argparse.Namespace) -> int:
+    try:
+        secret = get_secret()
         print(binascii.hexlify(secret).decode('ascii'))
-    elif mode.endswith('server'):
-        singleton = False
-        if mode == 'ensure-server':
-            singleton = True
-        try:
-            server = RClipServer(secret, '127.0.0.1', port, singleton)
-        except ServerExistsError:
-            sys.exit(0)
+        return 0
+    except AssertionError:
+        return 1
+
+
+def server_cmd(args: argparse.Namespace) -> int:
+    try:
+        secret = get_secret()
+        server = RClipServer(secret, '127.0.0.1', args.port)
         server.listen_loop()
+        return 0
+    except Exception as e:
+        opoo(e)
+        return 1
 
-    elif mode == 'copy':
-        try:
-            client = RClipClient(secret, '127.0.0.1', port)
-        except socket.error:
-            opoo('connection failed')
-            sys.exit(1)
-        try:
-            client.copy()
-        except CopyFailedError:
-            opoo('server error occurred while copying')
-            sys.exit(1)
-        except RClipProtocolError:
-            opoo('protocol error occurred while copying')
-            sys.exit(1)
-        except socket.error as e:
-            opoo('error occurred while copying', e)
-            sys.exit(1)
 
-    elif mode == 'paste':
-        try:
-            client = RClipClient(secret, '127.0.0.1', port)
-        except socket.error:
-            opoo('connection failed')
-            sys.exit(1)
-        try:
-            client.paste()
-        except RClipProtocolError:
-            opoo('protocol error occurred while pasting')
-            sys.exit(1)
-        except socket.error as e:
-            opoo('error occurred while pasting', e)
-            sys.exit(1)
-    else:
-        opoo('unknown mode', mode)
+def copy_cmd(args: argparse.Namespace) -> int:
+    try:
+        secret = get_secret()
+        client = RClipClient(secret, '127.0.0.1', args.port)
+    except socket.error:
+        opoo('connection failed')
+        return 1
+    try:
+        client.copy()
+    except CopyFailedError:
+        opoo('server error occurred while copying')
+        return 1
+    except RClipProtocolError:
+        opoo('protocol error occurred while copying')
+        return 1
+    except socket.error as e:
+        opoo('error occurred while copying', e)
+        return 1
+    return 0
+
+
+def paste_cmd(args: argparse.Namespace) -> int:
+    try:
+        secret = get_secret()
+        client = RClipClient(secret, '127.0.0.1', args.port)
+    except socket.error:
+        opoo('connection failed')
+        return 1
+    try:
+        client.paste()
+    except RClipProtocolError:
+        opoo('protocol error occurred while pasting')
+        return 1
+    except socket.error as e:
+        opoo('error occurred while pasting', e)
+        return 1
+
+    return 0
 
 
 if __name__ == '__main__':
